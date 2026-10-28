@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Convert NISAR L-band GUNW coherenceMagnitude (~80 m) to NSIDC EASE2 M0p1 (~100 m).
 
-Per-GUNW interferometric pair/per-polarization output. No denoising, masking by
-quality or land cover, thresholding, or temporal/spatial mosaicking. Only NODATA
-handling and required reprojection/resampling are performed.
+Per-GUNW interferometric pair/per-polarization output. Mask invalid regions
+using the native GUNW unwrappedInterferogram/mask (WRS encoding) plus an
+optional 2-pixel inward boundary buffer. Water and valid low-coherence data
+are retained. No coherence threshold, speckle filtering or mosaicking.
 
 Usage:
     python nisar_gunw_coherence_ease2.py --input granule.h5 --output-dir output
@@ -38,6 +39,7 @@ EASE2_TOP = 0.5 * EASE2_ROWS * PIXEL_M
 GROUP = 'unwrappedInterferogram'  # ~80 m input; no wrappedInterferogram (~20 m)
 FREQUENCY = 'frequencyA'  # mission-generated GUNW is frequency A only
 BLOCK_ROWS = 256
+DEFAULT_EDGE_BUFFER_PIXELS = 2
 
 
 def _source_grid(hf: h5py.File):
@@ -99,8 +101,49 @@ def _valid_fill_values(ds):
     return values
 
 
+def _gunw_mask_is_valid(mask: np.ndarray) -> np.ndarray:
+    """GUNW WRS: water flag (keep water), reference and secondary subswaths.
+
+    Valid requires nonzero reference and secondary subswaths. The special
+    fill value 255 is never valid. Works for uint8 or wider mask datasets.
+    """
+    mask = np.asarray(mask)
+    return ((mask != 255) &
+            (((mask // 10) % 10) != 0) &
+            ((mask % 10) != 0))
+
+
+def _inward_buffer(valid: np.ndarray, radius: int) -> np.ndarray:
+    """Square erosion of native validity; no scipy required."""
+    if radius == 0:
+        return valid
+    rows, cols = valid.shape
+    padded = np.pad(valid, ((radius, radius), (radius, radius)),
+                    constant_values=False)
+    buffered = np.ones((rows, cols), dtype=bool)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            buffered &= padded[radius + dy:radius + dy + rows,
+                               radius + dx:radius + dx + cols]
+    return buffered
+
+
+def _read_valid_mask_rows(mask_ds: h5py.Dataset, row: int, n: int,
+                          height: int, buffer_pixels: int) -> np.ndarray:
+    """Include a halo so the result does not depend on row-block boundaries."""
+    row_start = max(0, row - buffer_pixels)
+    row_end = min(height, row + n + buffer_pixels)
+    valid = _gunw_mask_is_valid(mask_ds[row_start:row_end, :])
+    valid = _inward_buffer(valid, buffer_pixels)
+    row_offset = row - row_start
+    return valid[row_offset:row_offset+n, :]
+
+
 def convert(input_path: str | Path, output_dir: str | Path, *, resampling='nearest',
-            polarizations='all', overwrite=False):
+            polarizations='all', overwrite=False,
+            edge_buffer_pixels=DEFAULT_EDGE_BUFFER_PIXELS):
+    if not isinstance(edge_buffer_pixels, int) or not (0 <= edge_buffer_pixels <= 20):
+        raise ValueError('edge_buffer_pixels must be an integer between 0 and 20')
     input_path = Path(input_path)
     if not input_path.is_file():
         raise FileNotFoundError(input_path)
@@ -112,6 +155,15 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
     with h5py.File(input_path, 'r') as hf:
         grp, src_crs, src_tr, width, height = _source_grid(hf)
         dst_tr, dst_width, dst_height = _target_grid(src_crs, src_tr, width, height)
+        if 'mask' not in grp:
+            raise KeyError(
+                f'GUNW WRS validity mask missing at {grp.name}/mask; '
+                'refusing to export unmasked edge data')
+        mask_ds = grp['mask']
+        if not isinstance(mask_ds, h5py.Dataset) or mask_ds.shape != (height, width):
+            raise ValueError(
+                f'GUNW mask shape {getattr(mask_ds, "shape", None)} '
+                f'does not match grid {(height, width)}')
         pols = [p for p in ('HH', 'VV') if p in grp and 'coherenceMagnitude' in grp[p]]
         if polarizations.upper() != 'ALL':
             pols = [p for p in pols if p == polarizations.upper()]
@@ -130,11 +182,20 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                     if (previous.count == 1 and previous.crs == CRS.from_epsg(OUT_EPSG)
                         and previous.width == dst_width and previous.height == dst_height
                         and previous.transform.almost_equals(dst_tr)):
-                        LOG.info('SKIP existing valid output: %s', out_file)
-                        outputs.append(out_file)
-                        continue
+                        tags = previous.tags()
+                        if (tags.get('source_validity_mask') == 'GUNW_WRS' and
+                            tags.get('mask_edge_buffer_pixels') == str(edge_buffer_pixels)):
+                            LOG.info('SKIP existing masked output: %s', out_file)
+                            outputs.append(out_file)
+                            continue
+                        raise RuntimeError(
+                            f'Output is from older/unmasked processing: {out_file}; '
+                            'use --overwrite to regenerate with validity mask')
                 raise RuntimeError(f'Existing output has wrong grid; choose --overwrite: {out_file}')
             fills = _valid_fill_values(ds)
+            rejected_mask = 0
+            rejected_bad_coherence = 0
+            kept = 0
             # A temporary on-disk source raster enables GDAL to warp blockwise
             # without loading an entire frame into memory.
             with tempfile.TemporaryDirectory(prefix='gunw_') as tmp:
@@ -147,11 +208,17 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                     for row in range(0, height, BLOCK_ROWS):
                         n = min(BLOCK_ROWS, height - row)
                         vals = np.asarray(ds[row:row+n, :], dtype='float32')
-                        invalid = ~np.isfinite(vals)
+                        good_swath = _read_valid_mask_rows(
+                            mask_ds, row, n, height, edge_buffer_pixels)
+                        good_value = np.isfinite(vals) & (vals >= 0) & (vals <= 1)
                         for fill in fills:
-                            if np.isfinite(fill): invalid |= (vals == fill)
-                        if invalid.any():
-                            vals[invalid] = np.nan
+                            if np.isfinite(fill):
+                                good_value &= (vals != fill)
+                        rejected_mask += int((~good_swath).sum())
+                        rejected_bad_coherence += int((~good_value).sum())
+                        good = good_swath & good_value
+                        kept += int(good.sum())
+                        vals[~good] = np.nan
                         src_writer.write(vals, 1, window=Window(0, row, width, n))
                 # Avoid partial files on errors; use .tif.part name with explicit GTiff driver.
                 part = out_file.with_suffix('.tif.part')
@@ -175,7 +242,15 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                                         source_dataset=ds.name, source_epsg=src_crs.to_epsg(),
                                         target_grid='EASE-Grid 2.0 NSIDC M0p1',
                                         resampling=resampling, unit='unitless',
-                                        quality_filter='none', temporal_mosaic='none')
+                                        quality_filter='native_GUNW_validity_mask_only',
+                                        source_validity_mask='GUNW_WRS',
+                                        mask_dataset=mask_ds.name,
+                                        mask_rule='reference_subswath>0_and_secondary_subswath>0',
+                                        mask_edge_buffer_pixels=str(edge_buffer_pixels),
+                                        source_valid_pixels=str(kept),
+                                        source_invalid_mask_pixels=str(rejected_mask),
+                                        source_invalid_coherence_pixels=str(rejected_bad_coherence),
+                                        temporal_mosaic='none')
                     part.replace(out_file)
                 finally:
                     if part.exists(): part.unlink()
@@ -183,6 +258,10 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                 if (check.crs != CRS.from_epsg(OUT_EPSG) or
                     not np.allclose(check.res, (PIXEL_M, PIXEL_M), atol=1e-8)):
                     raise AssertionError('Output grid verification failed')
+            LOG.info(
+                'GUNW %s: retained=%d invalid_mask=%d invalid_coherence=%d '
+                '(native buffer=%d px, water retained)',
+                pol, kept, rejected_mask, rejected_bad_coherence, edge_buffer_pixels)
             LOG.info('SAVED %s', out_file)
             outputs.append(out_file)
     return outputs
@@ -190,15 +269,19 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--input', required=True, help='Local GUNW HDF5 path (DPS stages file input)')
+    p.add_argument('--input', required=True, help='Local GUNW HDF5 path')
     p.add_argument('--output-dir', default='output')
     p.add_argument('--resampling', choices=['average','nearest','bilinear'], default='nearest')
     p.add_argument('--polarizations', choices=['all','HH','VV'], default='all')
     p.add_argument('--overwrite', action='store_true')
+    p.add_argument('--edge-buffer-pixels', type=int, default=DEFAULT_EDGE_BUFFER_PIXELS,
+                   help='Inward trim of invalid-mask boundaries on native GUNW '
+                        'grid; default 2; 0 keeps mask without buffer')
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     files = convert(args.input, args.output_dir, resampling=args.resampling,
-                    polarizations=args.polarizations, overwrite=args.overwrite)
+                    polarizations=args.polarizations, overwrite=args.overwrite,
+                    edge_buffer_pixels=args.edge_buffer_pixels)
     print('Outputs:', *map(str, files), sep='\n  ')
 
 

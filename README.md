@@ -1,6 +1,34 @@
-# Fixes for MAAP GUNW 401/AccessDenied and PROJ proj.db errors
+# NISAR provisional GUNW coherence → EASE2 M0p1 (authenticated DPS)
 
-**Latest correction:** If the worker reports `CRSError: Cannot find proj.db`, the
+## NEW: native GUNW validity masking (October 2026)
+
+The processor now applies the HDF5 `frequencyA/unwrappedInterferogram/mask`
+on the native ~80 m GUNW grid BEFORE reprojection. GUNW uses a three-digit
+WRS encoding: water flag, reference subswath, secondary subswath.
+Both subswaths must be nonzero, and fill value 255 is rejected.
+**Water is retained. Valid low coherence (including zero) is retained.**
+Nonfinite, fill and physically impossible coherence values (<0 or >1) are
+also masked to NaN. The default DPS inward trim is two native pixels along
+invalid-mask boundaries, to suppress residual edge slivers. It also trims
+around internal invalid holes. For standalone CLI use, set
+`--edge-buffer-pixels 0` to use the exact source mask with no trim.
+All output pixels remain exactly aligned to the GCOV EASE2 M0p1 grid.
+No land-cover mask, coherence threshold, smoothing or mosaic.
+
+Existing processed GeoTIFFs are NOT retroactively updated: rebuild MAAP,
+reprocess affected GUNW granules, and replace earlier unmasked files.
+The notebook and `s3_url` positional input are unchanged. New GeoTIFF
+tags report masking rule, buffer and retained/rejected source pixel counts.
+
+Known product limitation: for some CPU-generated GUNW products, mask fill
+cannot be distinguished from invalid radar-swath pixels (ISCE3 issue #224,
+https://github.com/isce-framework/isce3/issues/224). The inward trim helps
+with small edge artifacts but cannot correct every product artifact.
+Inspect real outputs before scaling to all frames.
+
+## Previous corrections
+
+**PROJ correction:** If the worker reports `CRSError: Cannot find proj.db`, the
 `nisar_gunw_proj.py` helper now locates Rasterio's compatible PROJ database,
 configures the active GDAL/PROJ search path, and verifies EPSG:4326 and
 EPSG:6933 **before downloading the GUNW HDF5**. The Docker build also tests
