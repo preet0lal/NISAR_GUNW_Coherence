@@ -1,4 +1,12 @@
-# Fix for MAAP GUNW 401/AccessDenied — use the working GCOV authorization pattern
+# Fixes for MAAP GUNW 401/AccessDenied and PROJ proj.db errors
+
+**Latest correction:** If the worker reports `CRSError: Cannot find proj.db`, the
+`nisar_gunw_proj.py` helper now locates Rasterio's compatible PROJ database,
+configures the active GDAL/PROJ search path, and verifies EPSG:4326 and
+EPSG:6933 **before downloading the GUNW HDF5**. The Docker build also tests
+EPSG lookup, so missing PROJ data can be detected at registration time.
+The notebook and positional `s3_url` input configuration are unchanged.
+Rebuild/re-register in MAAP to pick up the updated GitHub commit.
 
 Your previous GUNW algorithm registered `gunw_file` as a **File Input**. That made MAAP's *separate pre-job staging service* download NISAR files without the user's NISAR authorization. S3 gave AccessDenied, while HTTPS gave Earthdata 401.
 

@@ -15,7 +15,8 @@ python -m pip install --no-cache-dir \
   's3fs>=2023.6'
 
 echo "[GUNW BUILD] Checking imports..."
-python - <<'PY'
+BASEDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python - "$BASEDIR" <<'PY'
 from maap.maap import MAAP
 import s3fs
 import h5py
@@ -25,5 +26,10 @@ from affine import Affine
 print("[GUNW BUILD] All imports succeeded.")
 print("[GUNW BUILD] rasterio", rasterio.__version__)
 print("[GUNW BUILD] numpy", np.__version__)
+import sys
+sys.path.insert(0, sys.argv[1])
+from nisar_gunw_proj import configure_proj_database
+configure_proj_database()
+print("[GUNW BUILD] PROJ database verified for EPSG:4326 and EPSG:6933")
 PY
 echo "[GUNW BUILD] COMPLETE"

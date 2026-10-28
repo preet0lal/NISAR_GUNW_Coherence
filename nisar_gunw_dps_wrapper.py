@@ -37,6 +37,9 @@ def run(s3_url: str):
         from maap.maap import MAAP
     except ImportError as exc:
         raise RuntimeError('MAAP base environment needs maap-py and s3fs installed') from exc
+    # Validate Rasterio's PROJ database before downloading a multi-GB GUNW file.
+    from nisar_gunw_proj import configure_proj_database
+    configure_proj_database()
     from nisar_gunw_coherence_ease2 import convert
 
     input_dir = Path('input').resolve()
