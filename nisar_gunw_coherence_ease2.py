@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert NISAR L-band GUNW coherenceMagnitude (~80 m) to 100 m EPSG:6933.
+"""Convert NISAR L-band GUNW coherenceMagnitude (~80 m) to NSIDC EASE2 M0p1 (~100 m).
 
 Per-GUNW interferometric pair/per-polarization output. No denoising, masking by
 quality or land cover, thresholding, or temporal/spatial mosaicking. Only NODATA
@@ -28,7 +28,13 @@ from rasterio.windows import Window
 
 LOG = logging.getLogger('gunw_to_ease2')
 OUT_EPSG = 6933
-PIXEL_M = 100.0
+# EXACT grid definition used by the user's GCOV processing (NSIDC M0p1).
+# "100 m" is nominal. Native posting is 100.089502334956 m.
+PIXEL_M = 100.089502334956
+EASE2_COLS = 347040
+EASE2_ROWS = 146160
+EASE2_LEFT = -0.5 * EASE2_COLS * PIXEL_M
+EASE2_TOP = 0.5 * EASE2_ROWS * PIXEL_M
 GROUP = 'unwrappedInterferogram'  # ~80 m input; no wrappedInterferogram (~20 m)
 FREQUENCY = 'frequencyA'  # mission-generated GUNW is frequency A only
 BLOCK_ROWS = 256
@@ -61,22 +67,26 @@ def _source_grid(hf: h5py.File):
 
 
 def _target_grid(src_crs, src_transform, width, height):
-    # Transform full source raster footprint and align each frame to a common
-    # worldwide 100 m lattice with origin (0,0) in EPSG:6933.
+    """Crop the canonical NSIDC M0p1 global raster to the scene footprint.
+
+    Uses integer global row/column indices; all frames align with GCOV output.
+    """
     left, bottom, right, top = rasterio.transform.array_bounds(
         height, width, src_transform)
     xmin, ymin, xmax, ymax = transform_bounds(
         src_crs, CRS.from_epsg(OUT_EPSG), left, bottom, right, top,
         densify_pts=41)
-    xmin = math.floor(xmin / PIXEL_M) * PIXEL_M
-    ymin = math.floor(ymin / PIXEL_M) * PIXEL_M
-    xmax = math.ceil(xmax / PIXEL_M) * PIXEL_M
-    ymax = math.ceil(ymax / PIXEL_M) * PIXEL_M
-    ncols = int(round((xmax - xmin) / PIXEL_M))
-    nrows = int(round((ymax - ymin) / PIXEL_M))
+
+    col0 = max(0, math.floor((xmin - EASE2_LEFT) / PIXEL_M))
+    col1 = min(EASE2_COLS, math.ceil((xmax - EASE2_LEFT) / PIXEL_M))
+    row0 = max(0, math.floor((EASE2_TOP - ymax) / PIXEL_M))
+    row1 = min(EASE2_ROWS, math.ceil((EASE2_TOP - ymin) / PIXEL_M))
+    ncols, nrows = col1-col0, row1-row0
     if ncols <= 0 or nrows <= 0:
-        raise ValueError(f'Invalid output shape {nrows} x {ncols}')
-    return Affine(PIXEL_M, 0, xmin, 0, -PIXEL_M, ymax), ncols, nrows
+        raise ValueError(f'Invalid output grid: {nrows} x {ncols}')
+    origin_x = EASE2_LEFT + col0 * PIXEL_M
+    origin_y = EASE2_TOP - row0 * PIXEL_M
+    return Affine(PIXEL_M, 0, origin_x, 0, -PIXEL_M, origin_y), ncols, nrows
 
 
 def _valid_fill_values(ds):
@@ -163,14 +173,15 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                         dst.update_tags(product='NISAR GUNW coherenceMagnitude',
                                         source_granule=input_path.name,
                                         source_dataset=ds.name, source_epsg=src_crs.to_epsg(),
-                                        target_grid='EASE-Grid 2.0 Global',
+                                        target_grid='EASE-Grid 2.0 NSIDC M0p1',
                                         resampling=resampling, unit='unitless',
                                         quality_filter='none', temporal_mosaic='none')
                     part.replace(out_file)
                 finally:
                     if part.exists(): part.unlink()
             with rasterio.open(out_file) as check:
-                if (check.crs != CRS.from_epsg(OUT_EPSG) or check.res != (100., 100.)):
+                if (check.crs != CRS.from_epsg(OUT_EPSG) or
+                    not np.allclose(check.res, (PIXEL_M, PIXEL_M), atol=1e-8)):
                     raise AssertionError('Output grid verification failed')
             LOG.info('SAVED %s', out_file)
             outputs.append(out_file)
