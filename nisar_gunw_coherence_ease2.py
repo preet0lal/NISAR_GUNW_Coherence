@@ -2,9 +2,12 @@
 """Convert NISAR L-band GUNW coherenceMagnitude (~80 m) to NSIDC EASE2 M0p1 (~100 m).
 
 Per-GUNW interferometric pair/per-polarization output. Mask invalid regions
-using the native GUNW unwrappedInterferogram/mask (WRS encoding) plus an
-optional 2-pixel inward boundary buffer. Water and valid low-coherence data
-are retained. No coherence threshold, speckle filtering or mosaicking.
+using the native GUNW unwrappedInterferogram/mask and decoding the
+reference/secondary inputDataExceptionMask flags packed into uint32 mask
+values when present. Separate same-grid inputDataExceptionMask datasets
+are also supported. A 2-pixel inward boundary buffer remains optional.
+Valid water and low-coherence data are retained; no coherence threshold,
+speckle filtering or mosaicking.
 
 Usage:
     python nisar_gunw_coherence_ease2.py --input granule.h5 --output-dir output
@@ -101,16 +104,41 @@ def _valid_fill_values(ds):
     return values
 
 
-def _gunw_mask_is_valid(mask: np.ndarray) -> np.ndarray:
-    """GUNW WRS: water flag (keep water), reference and secondary subswaths.
+def _gunw_mask_components(mask: np.ndarray):
+    """Decode GUNW swath and input-data exception flags.
 
-    Valid requires nonzero reference and secondary subswaths. The special
-    fill value 255 is never valid. Works for uint8 or wider mask datasets.
+    GUNW mask layouts observed in products:
+      * Legacy uint8: decimal WRS (water/ref-subswath/sec-subswath).
+      * Packed uint32: low byte = 10*ref_subswath + sec_subswath;
+        bits 8-15 = secondary inputDataExceptionMask;
+        bits 16-23 = reference inputDataExceptionMask.
+
+    Do not treat packed uint32 as a decimal WRS integer: doing so can
+    incorrectly keep pixels flagged for sample slip/shift.
     """
-    mask = np.asarray(mask)
-    return ((mask != 255) &
-            (((mask // 10) % 10) != 0) &
-            ((mask % 10) != 0))
+    m = np.asarray(mask)
+    if not np.issubdtype(m.dtype, np.integer):
+        raise TypeError(f'GUNW mask must have integer dtype, got {m.dtype}')
+    bits = m.astype(np.uint32, copy=False)
+    low = bits & np.uint32(255)
+    subswath_valid = ((low != 255) &
+                      (((low // 10) % 10) != 0) &
+                      ((low % 10) != 0))
+    if m.dtype.itemsize > 1:
+        # Decode both source RSLC exception channels. Nonzero means
+        # reject, same criterion used for the standalone GCOV mask.
+        secondary = (bits >> np.uint32(8)) & np.uint32(255)
+        reference = (bits >> np.uint32(16)) & np.uint32(255)
+        exception_valid = (secondary == 0) & (reference == 0)
+    else:
+        exception_valid = np.ones(m.shape, dtype=bool)
+    return subswath_valid, exception_valid
+
+
+def _gunw_mask_is_valid(mask: np.ndarray, use_exception_mask=True) -> np.ndarray:
+    """Public native validity check; no low-coherence rejection."""
+    swath, exception = _gunw_mask_components(mask)
+    return swath & exception if use_exception_mask else swath
 
 
 def _inward_buffer(valid: np.ndarray, radius: int) -> np.ndarray:
@@ -128,20 +156,60 @@ def _inward_buffer(valid: np.ndarray, radius: int) -> np.ndarray:
     return buffered
 
 
+def _find_exception_dataset(grp: h5py.Group, pol: str, shape: tuple):
+    """Only search same-grid parent/polarization groups; no cross-grid reuse."""
+    for parent in (grp, grp[pol]):
+        ds = parent.get('inputDataExceptionMask')
+        if ds is None:
+            continue
+        if not isinstance(ds, h5py.Dataset):
+            raise TypeError(f'{parent.name}/inputDataExceptionMask is not a dataset')
+        if ds.shape != shape or not np.issubdtype(ds.dtype, np.integer):
+            raise ValueError(
+                f'{ds.name}: expected integer exception mask with shape {shape}, '
+                f'got shape={ds.shape}, dtype={ds.dtype}')
+        return ds
+    return None
+
+
 def _read_valid_mask_rows(mask_ds: h5py.Dataset, row: int, n: int,
-                          height: int, buffer_pixels: int) -> np.ndarray:
-    """Include a halo so the result does not depend on row-block boundaries."""
+                          height: int, buffer_pixels: int,
+                          exception_ds=None, use_exception_mask=True):
+    """Validity and statistics for a row block, with correct erosion halo."""
     row_start = max(0, row - buffer_pixels)
     row_end = min(height, row + n + buffer_pixels)
-    valid = _gunw_mask_is_valid(mask_ds[row_start:row_end, :])
-    valid = _inward_buffer(valid, buffer_pixels)
-    row_offset = row - row_start
-    return valid[row_offset:row_offset+n, :]
+    raw = mask_ds[row_start:row_end, :]
+    swath_ok, packed_exception_ok = _gunw_mask_components(raw)
+    if use_exception_mask and exception_ds is not None:
+        # Same as the GCOV code: exactly zero means no input anomalies.
+        separate_exception_ok = (exception_ds[row_start:row_end, :] == 0)
+    else:
+        separate_exception_ok = np.ones(swath_ok.shape, dtype=bool)
+
+    good = swath_ok.copy()
+    if use_exception_mask:
+        good &= packed_exception_ok & separate_exception_ok
+
+    buffered = _inward_buffer(good, buffer_pixels)
+    offset = row - row_start
+    sl = slice(offset, offset+n)
+    counts = {
+        'invalid_swath': int(np.count_nonzero(~swath_ok[sl])),
+        'invalid_packed_exception': (
+            int(np.count_nonzero(~packed_exception_ok[sl]))
+            if use_exception_mask else 0),
+        'invalid_separate_exception': (
+            int(np.count_nonzero(~separate_exception_ok[sl]))
+            if use_exception_mask else 0),
+        'removed_by_buffer': int(np.count_nonzero(good[sl] & ~buffered[sl])),
+    }
+    return buffered[sl], counts
 
 
 def convert(input_path: str | Path, output_dir: str | Path, *, resampling='nearest',
             polarizations='all', overwrite=False,
-            edge_buffer_pixels=DEFAULT_EDGE_BUFFER_PIXELS):
+            edge_buffer_pixels=DEFAULT_EDGE_BUFFER_PIXELS,
+            use_exception_mask=True):
     if not isinstance(edge_buffer_pixels, int) or not (0 <= edge_buffer_pixels <= 20):
         raise ValueError('edge_buffer_pixels must be an integer between 0 and 20')
     input_path = Path(input_path)
@@ -165,6 +233,9 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                 f'GUNW mask shape {getattr(mask_ds, "shape", None)} '
                 f'does not match grid {(height, width)}')
         pols = [p for p in ('HH', 'VV') if p in grp and 'coherenceMagnitude' in grp[p]]
+        print(f'[GUNW MASK] Source mask: {mask_ds.name}, dtype={mask_ds.dtype}, '
+              f'packed_exception_bits={mask_ds.dtype.itemsize > 1}, '
+              f'use_exception_mask={use_exception_mask}', flush=True)
         if polarizations.upper() != 'ALL':
             pols = [p for p in pols if p == polarizations.upper()]
         if not pols:
@@ -183,8 +254,9 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                         and previous.width == dst_width and previous.height == dst_height
                         and previous.transform.almost_equals(dst_tr)):
                         tags = previous.tags()
-                        if (tags.get('source_validity_mask') == 'GUNW_WRS' and
-                            tags.get('mask_edge_buffer_pixels') == str(edge_buffer_pixels)):
+                        if (tags.get('source_validity_mask') == 'GUNW_WRS_exception_v2' and
+                            tags.get('mask_edge_buffer_pixels') == str(edge_buffer_pixels) and
+                            tags.get('use_input_data_exception_mask') == str(use_exception_mask).lower()):
                             LOG.info('SKIP existing masked output: %s', out_file)
                             outputs.append(out_file)
                             continue
@@ -193,7 +265,20 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                             'use --overwrite to regenerate with validity mask')
                 raise RuntimeError(f'Existing output has wrong grid; choose --overwrite: {out_file}')
             fills = _valid_fill_values(ds)
+            exception_ds = _find_exception_dataset(grp, pol, (height, width))
+            if exception_ds is None and mask_ds.dtype.itemsize == 1 and use_exception_mask:
+                print(f'[GUNW MASK] WARNING: {pol}: source uses uint8 WRS '
+                      'and contains no separate inputDataExceptionMask; '
+                      'input-data exception flags are unavailable. '
+                      'Cannot guarantee sample-slip strips are removed.',
+                      flush=True)
+            elif exception_ds is not None:
+                print(f'[GUNW MASK] {pol}: separate exception dataset = '
+                      f'{exception_ds.name}', flush=True)
             rejected_mask = 0
+            rejected_packed_exception = 0
+            rejected_separate_exception = 0
+            rejected_buffer = 0
             rejected_bad_coherence = 0
             kept = 0
             # A temporary on-disk source raster enables GDAL to warp blockwise
@@ -208,13 +293,18 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                     for row in range(0, height, BLOCK_ROWS):
                         n = min(BLOCK_ROWS, height - row)
                         vals = np.asarray(ds[row:row+n, :], dtype='float32')
-                        good_swath = _read_valid_mask_rows(
-                            mask_ds, row, n, height, edge_buffer_pixels)
+                        good_swath, mask_counts = _read_valid_mask_rows(
+                            mask_ds, row, n, height, edge_buffer_pixels,
+                            exception_ds=exception_ds,
+                            use_exception_mask=use_exception_mask)
                         good_value = np.isfinite(vals) & (vals >= 0) & (vals <= 1)
                         for fill in fills:
                             if np.isfinite(fill):
                                 good_value &= (vals != fill)
-                        rejected_mask += int((~good_swath).sum())
+                        rejected_mask += mask_counts['invalid_swath']
+                        rejected_packed_exception += mask_counts['invalid_packed_exception']
+                        rejected_separate_exception += mask_counts['invalid_separate_exception']
+                        rejected_buffer += mask_counts['removed_by_buffer']
                         rejected_bad_coherence += int((~good_value).sum())
                         good = good_swath & good_value
                         kept += int(good.sum())
@@ -242,13 +332,19 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                                         source_dataset=ds.name, source_epsg=src_crs.to_epsg(),
                                         target_grid='EASE-Grid 2.0 NSIDC M0p1',
                                         resampling=resampling, unit='unitless',
-                                        quality_filter='native_GUNW_validity_mask_only',
-                                        source_validity_mask='GUNW_WRS',
+                                        quality_filter='native_GUNW_mask_plus_input_exceptions',
+                                        source_validity_mask='GUNW_WRS_exception_v2',
                                         mask_dataset=mask_ds.name,
-                                        mask_rule='reference_subswath>0_and_secondary_subswath>0',
+                                        mask_rule='subswath_R_and_S>0; packed_ref_sec_exception==0',
+                                        use_input_data_exception_mask=str(use_exception_mask).lower(),
+                                        packed_exception_mask_present=str(mask_ds.dtype.itemsize > 1).lower(),
+                                        separate_exception_dataset=(exception_ds.name if exception_ds is not None else 'none'),
                                         mask_edge_buffer_pixels=str(edge_buffer_pixels),
                                         source_valid_pixels=str(kept),
                                         source_invalid_mask_pixels=str(rejected_mask),
+                                        source_invalid_packed_exception_pixels=str(rejected_packed_exception),
+                                        source_invalid_separate_exception_pixels=str(rejected_separate_exception),
+                                        source_buffer_removed_pixels=str(rejected_buffer),
                                         source_invalid_coherence_pixels=str(rejected_bad_coherence),
                                         temporal_mosaic='none')
                     part.replace(out_file)
@@ -259,9 +355,12 @@ def convert(input_path: str | Path, output_dir: str | Path, *, resampling='neare
                     not np.allclose(check.res, (PIXEL_M, PIXEL_M), atol=1e-8)):
                     raise AssertionError('Output grid verification failed')
             LOG.info(
-                'GUNW %s: retained=%d invalid_mask=%d invalid_coherence=%d '
+                'GUNW %s: retained=%d invalid_swath=%d packed_exception=%d '
+                'separate_exception=%d buffer_removed=%d invalid_coherence=%d '
                 '(native buffer=%d px, water retained)',
-                pol, kept, rejected_mask, rejected_bad_coherence, edge_buffer_pixels)
+                pol, kept, rejected_mask, rejected_packed_exception,
+                rejected_separate_exception, rejected_buffer,
+                rejected_bad_coherence, edge_buffer_pixels)
             LOG.info('SAVED %s', out_file)
             outputs.append(out_file)
     return outputs
@@ -277,11 +376,15 @@ def main():
     p.add_argument('--edge-buffer-pixels', type=int, default=DEFAULT_EDGE_BUFFER_PIXELS,
                    help='Inward trim of invalid-mask boundaries on native GUNW '
                         'grid; default 2; 0 keeps mask without buffer')
+    p.add_argument('--use-exception-mask', choices=['yes','no'], default='yes',
+                   help='Reject any flagged reference/secondary input data '
+                        'exceptions in packed GUNW mask and separate mask (default yes)')
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     files = convert(args.input, args.output_dir, resampling=args.resampling,
                     polarizations=args.polarizations, overwrite=args.overwrite,
-                    edge_buffer_pixels=args.edge_buffer_pixels)
+                    edge_buffer_pixels=args.edge_buffer_pixels,
+                    use_exception_mask=(args.use_exception_mask == 'yes'))
     print('Outputs:', *map(str, files), sep='\n  ')
 
 

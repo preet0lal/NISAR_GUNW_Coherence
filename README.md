@@ -1,10 +1,42 @@
 # NISAR provisional GUNW coherence → EASE2 M0p1 (authenticated DPS)
 
-## NEW: native GUNW validity masking (October 2026)
+## NEW: packed reference/secondary inputDataExceptionMask (October 2026)
+
+This implements GCOV's **reject every nonzero input-data exception flag**
+for GUNW. GUNW can encode the two RSLC input-data exception masks in
+the same native `unwrappedInterferogram/mask` dataset:
+* lower byte = decimal `10 * reference_subswath + secondary_subswath`;
+* bits 8–15 = secondary RSLC inputDataExceptionMask;
+* bits 16–23 = reference RSLC inputDataExceptionMask.
+
+On uint32 masks, exclude a pixel if **either exception byte is nonzero**.
+The code also checks a standalone, same-grid `inputDataExceptionMask`
+dataset if present, requiring `== 0` exactly as in GCOV.
+For legacy uint8 GUNW/WRS products, the high exception bits do not
+exist. If no standalone dataset is present, the job **warns explicitly**:
+it cannot flag strips from unavailable exception information.
+
+The previous processor only parsed the decimal WRS part, ignoring or
+misinterpreting packed high bytes. This version decodes the lower byte
+separately, preserving both the water/subswath convention and the packed
+exception flags. It retains the two-native-pixel inward buffer.
+
+**Limitations:** Flagged stripes will disappear only where the NISAR
+product actually provides the exception flags. Known ISCE3 production
+versions have a bug that can clear exception bits during mask generation
+(https://github.com/isce-framework/isce3/issues/335). Inspect sample
+outputs and the per-scene flag counts before scaling up the pipeline.
+
+Existing outputs need rebuilding: the output metadata now contains
+`source_validity_mask=GUNW_WRS_exception_v2` and the counts of flagged
+source pixels. Run the same S3-auth notebook after registering a new
+algorithm build from updated `main`; no new notebook arguments required.
+
+## Previous: native GUNW validity masking (October 2026)
 
 The processor now applies the HDF5 `frequencyA/unwrappedInterferogram/mask`
 on the native ~80 m GUNW grid BEFORE reprojection. GUNW uses a three-digit
-WRS encoding: water flag, reference subswath, secondary subswath.
+WRS encoding in the low byte: water flag (when present), reference subswath, secondary subswath.
 Both subswaths must be nonzero, and fill value 255 is rejected.
 **Water is retained. Valid low coherence (including zero) is retained.**
 Nonfinite, fill and physically impossible coherence values (<0 or >1) are

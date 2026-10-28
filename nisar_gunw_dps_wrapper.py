@@ -67,7 +67,7 @@ def run(s3_url: str):
             raise RuntimeError('Downloaded HDF5 is missing or empty')
         print(f'Downloaded {local_h5.stat().st_size / (1024**3):.3f} GiB', flush=True)
         produced = convert(local_h5, output_dir, resampling='nearest',
-                           edge_buffer_pixels=2)
+                           edge_buffer_pixels=2, use_exception_mask=True)
         if not produced:
             raise RuntimeError('Conversion completed but produced no GeoTIFF')
         for p in produced:
